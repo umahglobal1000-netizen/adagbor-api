@@ -5,4 +5,4 @@ compatibility_date = "2026-09-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "adagbor-db"
-database_id = "YOUR_DATABASE_ID"
+database_id = "402be4a6-b3de-4833-830b-78d1fd817197"
