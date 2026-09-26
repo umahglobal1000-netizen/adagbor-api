@@ -1,5 +1,5 @@
 name = "adagbor-api"
-main = "worker.js"
+main = "Adagbor.js"
 compatibility_date = "2026-09-01"
 
 [[d1_databases]]
