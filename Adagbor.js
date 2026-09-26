@@ -1,12 +1,17 @@
 // Adagbor.js
 // Single-file Cloudflare Worker for the Adagbor Descendant Association API.
-// Combines what used to be worker.js + auth-routes.js + admin-set-password.js
-// + forgot-password-routes.js into one file for easier mobile upload/management.
 //
 // Bindings/secrets required (Cloudflare dashboard → Settings → Variables and Secrets):
 //   DB               - D1 database binding
 //   ADMIN_KEY        - shared secret for X-Admin-Key admin routes
 //   RESEND_API_KEY   - Resend.com API key, for password-reset emails
+//
+// D1 table for auto-sync (run once in D1 Console):
+//   CREATE TABLE IF NOT EXISTS app_store (
+//     key TEXT PRIMARY KEY,
+//     value TEXT NOT NULL,
+//     updated_at TEXT NOT NULL
+//   );
 
 const SESSION_COOKIE = "adagbor_session";
 const SESSION_DAYS = 30;
@@ -24,7 +29,7 @@ function json(data, status = 200) {
   });
 }
 
-// ---------- Password hashing (Web Crypto PBKDF2 — no bcrypt binding needed on Workers) ----------
+// ---------- Password hashing (Web Crypto PBKDF2) ----------
 
 async function hashPassword(password, saltHex) {
   const enc = new TextEncoder();
@@ -93,10 +98,32 @@ function getSessionToken(request) {
   return match ? match[1] : null;
 }
 
+// ---------- App store (announcements, resolutions, attendance, payments, etc.) ----------
+
+async function storeGet(env, key) {
+  const row = await env.DB.prepare(
+    `SELECT value FROM app_store WHERE key = ?`
+  ).bind(key).first();
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value);
+  } catch {
+    return row.value;
+  }
+}
+
+async function storePut(env, key, value) {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO app_store (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).bind(key, JSON.stringify(value), now).run();
+}
+
 // ---------- Login ----------
 
 async function handleLogin(request, env) {
-  const { identifier, password } = await request.json(); // identifier = email or phone
+  const { identifier, password } = await request.json();
   if (!identifier || !password) {
     return json({ error: "Missing credentials." }, 400);
   }
@@ -138,8 +165,6 @@ async function handleLogin(request, env) {
   });
 }
 
-// ---------- Session-protected "my dashboard" endpoint ----------
-
 async function handleMe(request, env) {
   const token = getSessionToken(request);
   if (!token) return json({ error: "Not logged in." }, 401);
@@ -152,11 +177,20 @@ async function handleMe(request, env) {
     return json({ error: "Session expired. Please log in again." }, 401);
   }
 
-  const member = await env.DB.prepare(
+  // Include photo if column exists; query fails gracefully handled by optional second try
+  let member = await env.DB.prepare(
     `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email, address,
-            next_of_kin_name, next_of_kin_phone, status
+            next_of_kin_name, next_of_kin_phone, status, photo
      FROM members WHERE id = ?`
-  ).bind(session.member_id).first();
+  ).bind(session.member_id).first().catch(() => null);
+
+  if (!member) {
+    member = await env.DB.prepare(
+      `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email, address,
+              next_of_kin_name, next_of_kin_phone, status
+       FROM members WHERE id = ?`
+    ).bind(session.member_id).first();
+  }
 
   return json({ member });
 }
@@ -174,8 +208,6 @@ async function handleLogout(request, env) {
     },
   });
 }
-
-// ---------- Admin: set a member's password directly (fallback/override) ----------
 
 async function handleSetPassword(request, env, memberId) {
   const { password } = await request.json();
@@ -204,8 +236,6 @@ async function handleSetPassword(request, env, memberId) {
   });
 }
 
-// ---------- Forgot / reset password ----------
-
 async function handleForgotPassword(request, env) {
   const { email } = await request.json();
   if (!email) {
@@ -216,8 +246,6 @@ async function handleForgotPassword(request, env) {
     `SELECT id, full_name FROM members WHERE email = ?`
   ).bind(email).first();
 
-  // Always return the same success message whether or not the email
-  // exists — this avoids leaking which emails are registered members.
   const genericResponse = {
     success: true,
     message: "If that email is registered, a reset link has been sent.",
@@ -242,6 +270,10 @@ async function handleForgotPassword(request, env) {
 }
 
 async function sendResetEmail(env, toEmail, fullName, resetLink) {
+  if (!env.RESEND_API_KEY) {
+    console.error("RESEND_API_KEY not set");
+    return;
+  }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
@@ -249,7 +281,7 @@ async function sendResetEmail(env, toEmail, fullName, resetLink) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: "Adagbor Descendant Association <onboarding@resend.dev>", // swap once your domain is verified
+      from: "Adagbor Descendant Association <onboarding@resend.dev>",
       to: [toEmail],
       subject: "Reset your Adagbor Descendant Association password",
       html: `
@@ -311,7 +343,7 @@ export default {
   async fetch(request, env) {
     const corsHeaders = {
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, X-Admin-Key",
       "Access-Control-Allow-Credentials": "true",
     };
@@ -323,7 +355,25 @@ export default {
     const url = new URL(request.url);
     const jsonHeaders = { "Content-Type": "application/json", ...corsHeaders };
 
-    // ---- Public: submit a new membership application (with password) ----
+    // ---- Public store read (announcements, resolutions, etc.) ----
+    const storeMatch = url.pathname.match(/^\/api\/store\/([^/]+)$/);
+    if (request.method === "GET" && storeMatch) {
+      try {
+        const key = decodeURIComponent(storeMatch[1]);
+        const value = await storeGet(env, key);
+        return new Response(JSON.stringify({ value }), {
+          status: 200,
+          headers: jsonHeaders,
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Server error", detail: String(err) }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+    }
+
+    // ---- Public: submit membership application ----
     if (request.method === "POST" && url.pathname === "/api/members") {
       try {
         const body = await request.json();
@@ -343,25 +393,52 @@ export default {
 
         const { hash, salt } = await hashPassword(body.password);
 
-        await env.DB.prepare(
-          `INSERT INTO members
-           (full_name, gender, date_of_birth, branch, occupation, phone, email, address, next_of_kin_name, next_of_kin_phone, declared, password_hash, password_salt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          body.full_name,
-          body.gender || null,
-          body.date_of_birth || null,
-          body.branch || null,
-          body.occupation || null,
-          body.phone,
-          body.email || null,
-          body.address || null,
-          body.next_of_kin_name || null,
-          body.next_of_kin_phone || null,
-          body.declared ? 1 : 0,
-          hash,
-          salt
-        ).run();
+        // Prefer insert with photo if column exists
+        try {
+          await env.DB.prepare(
+            `INSERT INTO members
+             (full_name, gender, date_of_birth, branch, occupation, phone, email, address,
+              next_of_kin_name, next_of_kin_phone, declared, password_hash, password_salt, photo)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            body.full_name,
+            body.gender || null,
+            body.date_of_birth || null,
+            body.branch || null,
+            body.occupation || null,
+            body.phone,
+            body.email || null,
+            body.address || null,
+            body.next_of_kin_name || null,
+            body.next_of_kin_phone || null,
+            body.declared ? 1 : 0,
+            hash,
+            salt,
+            body.photo || null
+          ).run();
+        } catch (e) {
+          // Fallback without photo column
+          await env.DB.prepare(
+            `INSERT INTO members
+             (full_name, gender, date_of_birth, branch, occupation, phone, email, address,
+              next_of_kin_name, next_of_kin_phone, declared, password_hash, password_salt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            body.full_name,
+            body.gender || null,
+            body.date_of_birth || null,
+            body.branch || null,
+            body.occupation || null,
+            body.phone,
+            body.email || null,
+            body.address || null,
+            body.next_of_kin_name || null,
+            body.next_of_kin_phone || null,
+            body.declared ? 1 : 0,
+            hash,
+            salt
+          ).run();
+        }
 
         return new Response(JSON.stringify({ success: true }), {
           status: 201,
@@ -375,7 +452,6 @@ export default {
       }
     }
 
-    // ---- Public: member login / session-protected dashboard / logout ----
     if (request.method === "POST" && url.pathname === "/api/login") {
       const res = await handleLogin(request, env);
       return withCors(res, corsHeaders);
@@ -391,7 +467,6 @@ export default {
       return withCors(res, corsHeaders);
     }
 
-    // ---- Public: forgot / reset password ----
     if (request.method === "POST" && url.pathname === "/api/forgot-password") {
       const res = await handleForgotPassword(request, env);
       return withCors(res, corsHeaders);
@@ -402,9 +477,34 @@ export default {
       return withCors(res, corsHeaders);
     }
 
-    // ---- Admin-only endpoints below: require X-Admin-Key header ----
+    // ---- Admin-only ----
     const adminKey = request.headers.get("X-Admin-Key");
     const isAdmin = adminKey && env.ADMIN_KEY && adminKey === env.ADMIN_KEY;
+
+    // Admin store write (auto-sync for site data)
+    const adminStoreMatch = url.pathname.match(/^\/api\/admin\/store\/([^/]+)$/);
+    if (adminStoreMatch && request.method === "PUT") {
+      if (!isAdmin) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: jsonHeaders,
+        });
+      }
+      try {
+        const key = decodeURIComponent(adminStoreMatch[1]);
+        const body = await request.json();
+        await storePut(env, key, body.value);
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: jsonHeaders,
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Server error", detail: String(err) }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+    }
 
     if (url.pathname === "/api/admin/members") {
       if (!isAdmin) {
@@ -414,14 +514,24 @@ export default {
         });
       }
 
-      // List all members
       if (request.method === "GET") {
         try {
-          const { results } = await env.DB.prepare(
-            `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email,
-                    address, next_of_kin_name, next_of_kin_phone, status, submitted_at
-             FROM members ORDER BY submitted_at DESC`
-          ).all();
+          let results;
+          try {
+            const q = await env.DB.prepare(
+              `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email,
+                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at, photo
+               FROM members ORDER BY submitted_at DESC`
+            ).all();
+            results = q.results;
+          } catch (e) {
+            const q = await env.DB.prepare(
+              `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email,
+                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at
+               FROM members ORDER BY submitted_at DESC`
+            ).all();
+            results = q.results;
+          }
 
           return new Response(JSON.stringify({ members: results }), {
             status: 200,
@@ -435,7 +545,6 @@ export default {
         }
       }
 
-      // Update a member's status (approve/reject)
       if (request.method === "PATCH") {
         try {
           const body = await request.json();
@@ -463,7 +572,6 @@ export default {
       }
     }
 
-    // Admin: set a member's password directly (fallback/override)
     const setPasswordMatch = url.pathname.match(/^\/api\/admin\/members\/(\d+)\/set-password$/);
     if (setPasswordMatch && request.method === "PATCH") {
       if (!isAdmin) {
@@ -481,9 +589,6 @@ export default {
   },
 };
 
-// The internal handlers above build their own Response objects without CORS
-// headers; this re-wraps their response with this Worker's CORS headers,
-// preserving status, body and any headers they already set (e.g. Set-Cookie).
 async function withCors(response, corsHeaders) {
   const merged = new Headers(response.headers);
   for (const [key, value] of Object.entries(corsHeaders)) {
