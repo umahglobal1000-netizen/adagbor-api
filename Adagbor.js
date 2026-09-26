@@ -87,6 +87,14 @@ function generateToken() {
   return bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
 }
 
+// Numeric-only password for members added or reset by admin (e.g. "482915").
+function generateNumericPassword(length = 6) {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = "";
+  for (let i = 0; i < length; i++) out += (bytes[i] % 10).toString();
+  return out;
+}
+
 function cookieHeader(token, maxAgeDays = SESSION_DAYS) {
   const maxAge = maxAgeDays * 24 * 60 * 60;
   return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
@@ -234,6 +242,88 @@ async function handleSetPassword(request, env, memberId) {
     success: true,
     message: "Password set. Give this to the member directly (phone call, WhatsApp, in person) — not by email/SMS unless your channel is secure.",
   });
+}
+
+// Admin adds a member directly (no self-registration). Member goes straight
+// into the directory as approved, with a system-generated numeric password.
+async function handleAdminCreateMember(request, env) {
+  const body = await request.json();
+
+  if (!body.full_name || !body.phone) {
+    return json({ error: "Full name and phone are required." }, 400);
+  }
+
+  const plainPassword = generateNumericPassword(6);
+  const { hash, salt } = await hashPassword(plainPassword);
+
+  let insertedId = null;
+  try {
+    const result = await env.DB.prepare(
+      `INSERT INTO members
+       (full_name, gender, date_of_birth, branch, occupation, phone, email, address,
+        next_of_kin_name, next_of_kin_phone, declared, status, password_hash, password_salt, photo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'approved', ?, ?, ?)`
+    ).bind(
+      body.full_name,
+      body.gender || null,
+      body.date_of_birth || null,
+      body.branch || null,
+      body.occupation || null,
+      body.phone,
+      body.email || null,
+      body.address || null,
+      body.next_of_kin_name || null,
+      body.next_of_kin_phone || null,
+      hash,
+      salt,
+      body.photo || null
+    ).run();
+    insertedId = result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null;
+  } catch (e) {
+    // Fallback without photo column
+    const result = await env.DB.prepare(
+      `INSERT INTO members
+       (full_name, gender, date_of_birth, branch, occupation, phone, email, address,
+        next_of_kin_name, next_of_kin_phone, declared, status, password_hash, password_salt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'approved', ?, ?)`
+    ).bind(
+      body.full_name,
+      body.gender || null,
+      body.date_of_birth || null,
+      body.branch || null,
+      body.occupation || null,
+      body.phone,
+      body.email || null,
+      body.address || null,
+      body.next_of_kin_name || null,
+      body.next_of_kin_phone || null,
+      hash,
+      salt
+    ).run();
+    insertedId = result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null;
+  }
+
+  return json({ success: true, id: insertedId, password: plainPassword }, 201);
+}
+
+// Admin generates a fresh numeric password for a member who lost theirs.
+async function handleGeneratePassword(request, env, memberId) {
+  const member = await env.DB.prepare(
+    `SELECT id FROM members WHERE id = ?`
+  ).bind(memberId).first();
+
+  if (!member) {
+    return json({ error: "Member not found." }, 404);
+  }
+
+  const plainPassword = generateNumericPassword(6);
+  const { hash, salt } = await hashPassword(plainPassword);
+
+  await env.DB.prepare(
+    `UPDATE members SET password_hash = ?, password_salt = ? WHERE id = ?`
+  ).bind(hash, salt, memberId).run();
+
+  return json({ success: true, password: plainPassword });
 }
 
 async function handleForgotPassword(request, env) {
@@ -545,19 +635,73 @@ export default {
         }
       }
 
+      if (request.method === "POST") {
+        try {
+          const res = await handleAdminCreateMember(request, env);
+          return withCors(res, corsHeaders);
+        } catch (err) {
+          return new Response(JSON.stringify({ error: "Server error", detail: String(err) }), {
+            status: 500,
+            headers: jsonHeaders,
+          });
+        }
+      }
+
       if (request.method === "PATCH") {
         try {
           const body = await request.json();
-          if (!body.id || !body.status) {
-            return new Response(JSON.stringify({ error: "Missing id or status" }), {
+          if (!body.id) {
+            return new Response(JSON.stringify({ error: "Missing id" }), {
               status: 400,
               headers: jsonHeaders,
             });
           }
 
-          await env.DB.prepare(`UPDATE members SET status = ? WHERE id = ?`)
-            .bind(body.status, body.id)
-            .run();
+          // Update whichever editable fields were sent, so both the quick
+          // status-change dropdown and the full edit form work correctly.
+          const editable = [
+            "full_name", "gender", "date_of_birth", "branch", "occupation",
+            "phone", "email", "address", "next_of_kin_name", "next_of_kin_phone",
+            "status", "photo",
+          ];
+          const sets = [];
+          const values = [];
+          for (const field of editable) {
+            if (Object.prototype.hasOwnProperty.call(body, field)) {
+              sets.push(`${field} = ?`);
+              values.push(body[field]);
+            }
+          }
+          if (!sets.length) {
+            return new Response(JSON.stringify({ error: "No fields to update" }), {
+              status: 400,
+              headers: jsonHeaders,
+            });
+          }
+          values.push(body.id);
+
+          try {
+            await env.DB.prepare(`UPDATE members SET ${sets.join(", ")} WHERE id = ?`)
+              .bind(...values)
+              .run();
+          } catch (e) {
+            // Fallback if photo column doesn't exist on this database
+            const idx = editable.indexOf("photo");
+            if (Object.prototype.hasOwnProperty.call(body, "photo")) {
+              const sets2 = sets.filter((s) => !s.startsWith("photo"));
+              const values2 = [];
+              for (const field of editable) {
+                if (field === "photo") continue;
+                if (Object.prototype.hasOwnProperty.call(body, field)) values2.push(body[field]);
+              }
+              values2.push(body.id);
+              await env.DB.prepare(`UPDATE members SET ${sets2.join(", ")} WHERE id = ?`)
+                .bind(...values2)
+                .run();
+            } else {
+              throw e;
+            }
+          }
 
           return new Response(JSON.stringify({ success: true }), {
             status: 200,
@@ -582,6 +726,19 @@ export default {
       }
       const memberId = Number(setPasswordMatch[1]);
       const res = await handleSetPassword(request, env, memberId);
+      return withCors(res, corsHeaders);
+    }
+
+    const generatePasswordMatch = url.pathname.match(/^\/api\/admin\/members\/(\d+)\/generate-password$/);
+    if (generatePasswordMatch && request.method === "POST") {
+      if (!isAdmin) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: jsonHeaders,
+        });
+      }
+      const memberId = Number(generatePasswordMatch[1]);
+      const res = await handleGeneratePassword(request, env, memberId);
       return withCors(res, corsHeaders);
     }
 
