@@ -10,12 +10,12 @@
 
 const SESSION_COOKIE = "adagbor_session";
 const SESSION_DAYS = 30;
-const SITE_URL = "https://umahglobal1000-netizen.github.io/adagbor-site";
+const SITE_URL = "https://adagbor1.umahglobal1000.workers.dev";
 const RESET_TOKEN_MINUTES = 60;
 
 // Must be an exact origin (scheme + host), never "*" — required because
 // requests are sent with credentials: "include" (cookies).
-const ALLOWED_ORIGIN = "https://umahglobal1000-netizen.github.io";
+const ALLOWED_ORIGIN = "https://adagbor1.umahglobal1000.workers.dev";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
