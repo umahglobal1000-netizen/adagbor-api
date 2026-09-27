@@ -659,6 +659,61 @@ export default {
       return withCors(res, corsHeaders);
     }
 
+    // ---- Logged-in members: directory of approved members ----
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/api/member/directory" || url.pathname === "/api/members/directory")
+    ) {
+      try {
+        const token = getSessionToken(request);
+        if (!token) {
+          return new Response(JSON.stringify({ error: "Not logged in." }), {
+            status: 401,
+            headers: jsonHeaders,
+          });
+        }
+        const session = await env.DB.prepare(
+          `SELECT member_id, expires_at FROM sessions WHERE token = ?`
+        ).bind(token).first();
+        if (!session || new Date(session.expires_at) < new Date()) {
+          return new Response(JSON.stringify({ error: "Session expired. Please log in again." }), {
+            status: 401,
+            headers: jsonHeaders,
+          });
+        }
+
+        let results;
+        try {
+          const q = await env.DB.prepare(
+            `SELECT id, full_name, branch, phone, address, photo, status
+             FROM members
+             WHERE status = 'approved'
+             ORDER BY full_name ASC`
+          ).all();
+          results = q.results || [];
+        } catch (e) {
+          // Fallback if photo column missing
+          const q = await env.DB.prepare(
+            `SELECT id, full_name, branch, phone, address, status
+             FROM members
+             WHERE status = 'approved'
+             ORDER BY full_name ASC`
+          ).all();
+          results = q.results || [];
+        }
+
+        return new Response(JSON.stringify({ members: results }), {
+          status: 200,
+          headers: jsonHeaders,
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: "Server error", detail: String(err) }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/api/logout") {
       const res = await handleLogout(request, env);
       return withCors(res, corsHeaders);
