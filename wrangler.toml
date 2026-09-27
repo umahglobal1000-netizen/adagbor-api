@@ -10,6 +10,8 @@ database_id = "402be4a6-b3de-4833-830b-78d1fd817197"
 [observability]
 enabled = true
 
-# Secrets (set via `wrangler secret put`, not in this file):
+# Secrets (set via dashboard or `wrangler secret put`, not in this file):
 #   ADMIN_KEY
 #   RESEND_API_KEY
+#   KUDISMS_API_KEY
+#   KUDISMS_SENDER_ID

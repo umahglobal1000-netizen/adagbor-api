@@ -5,6 +5,8 @@
 //   DB               - D1 database binding
 //   ADMIN_KEY        - shared secret for X-Admin-Key admin routes
 //   RESEND_API_KEY   - Resend.com API key, for password-reset emails
+//   KUDISMS_API_KEY  - KudiSMS API token (Developers section)
+//   KUDISMS_SENDER_ID - approved promotional Sender ID (e.g. ADAGBOR)
 //
 // D1 table for auto-sync (run once in D1 Console):
 //   CREATE TABLE IF NOT EXISTS app_store (
@@ -126,6 +128,111 @@ async function storePut(env, key, value) {
     `INSERT INTO app_store (key, value, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
   ).bind(key, JSON.stringify(value), now).run();
+}
+
+// ---------- KudiSMS (promotional gateway) ----------
+
+/** Normalise Nigerian phone → 234XXXXXXXXXX */
+function normalizeNgPhone(phone) {
+  let p = String(phone || "").replace(/\D/g, "");
+  if (p.startsWith("0")) p = "234" + p.slice(1);
+  if (p.length === 10) p = "234" + p;
+  if (p.startsWith("2340")) p = "234" + p.slice(4);
+  return p;
+}
+
+/**
+ * Send one SMS via KudiSMS promotional route (gateway 2).
+ * DND numbers will not receive the message (charge refunded by KudiSMS).
+ * @returns {{ ok: boolean, error?: string, raw?: any }}
+ */
+async function sendSms(env, toPhone, message) {
+  if (!env.KUDISMS_API_KEY) {
+    console.error("KUDISMS_API_KEY not set");
+    return { ok: false, error: "SMS not configured" };
+  }
+
+  const to = normalizeNgPhone(toPhone);
+  if (!to || to.length < 13) {
+    return { ok: false, error: "Invalid phone number" };
+  }
+
+  const body = {
+    token: env.KUDISMS_API_KEY,
+    senderID: env.KUDISMS_SENDER_ID || "ADAGBOR",
+    recipients: to,
+    message: String(message).slice(0, 320),
+    gateway: "2",
+  };
+
+  try {
+    const res = await fetch("https://my.kudisms.net/api/sms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    const code = String(data.status || data.code || data.response || "");
+    if (code === "000") {
+      return { ok: true, raw: data };
+    }
+    console.error("KudiSMS error:", data);
+    return {
+      ok: false,
+      error: data.message || data.error || code || res.statusText,
+      raw: data,
+    };
+  } catch (e) {
+    console.error("SMS send failed:", e);
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Send SMS to many numbers (batches of 100).
+ * @returns {{ ok: boolean, results?: any[], error?: string }}
+ */
+async function sendSmsBulk(env, phones, message) {
+  if (!env.KUDISMS_API_KEY) {
+    return { ok: false, error: "SMS not configured" };
+  }
+  const recipients = [
+    ...new Set(
+      (phones || []).map(normalizeNgPhone).filter((p) => p && p.length >= 13)
+    ),
+  ];
+  if (!recipients.length) {
+    return { ok: false, error: "No valid phone numbers" };
+  }
+
+  const chunks = [];
+  for (let i = 0; i < recipients.length; i += 100) {
+    chunks.push(recipients.slice(i, i + 100));
+  }
+
+  const results = [];
+  for (const chunk of chunks) {
+    const body = {
+      token: env.KUDISMS_API_KEY,
+      senderID: env.KUDISMS_SENDER_ID || "ADAGBOR",
+      recipients: chunk.join(","),
+      message: String(message).slice(0, 320),
+      gateway: "2",
+    };
+    try {
+      const res = await fetch("https://my.kudisms.net/api/sms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      const code = String(data.status || data.code || "");
+      results.push({ ok: code === "000", count: chunk.length, raw: data });
+    } catch (e) {
+      results.push({ ok: false, count: chunk.length, error: String(e) });
+    }
+  }
+  return { ok: results.every((r) => r.ok), results, sent: recipients.length };
 }
 
 // ---------- Login ----------
@@ -703,6 +810,24 @@ export default {
             }
           }
 
+          // Optional SMS when membership is approved (promotional route)
+          if (body.status === "approved") {
+            try {
+              const m = await env.DB.prepare(
+                `SELECT full_name, phone FROM members WHERE id = ?`
+              ).bind(body.id).first();
+              if (m && m.phone) {
+                await sendSms(
+                  env,
+                  m.phone,
+                  `Adagbor Descendant Association: your membership is approved. Log in at ${SITE_URL}/login.html`
+                );
+              }
+            } catch (smsErr) {
+              console.error("Approval SMS failed:", smsErr);
+            }
+          }
+
           return new Response(JSON.stringify({ success: true }), {
             status: 200,
             headers: jsonHeaders,
@@ -713,6 +838,60 @@ export default {
             headers: jsonHeaders,
           });
         }
+      }
+    }
+
+    // ---- Admin: send promotional SMS ----
+    if (request.method === "POST" && url.pathname === "/api/admin/sms") {
+      if (!isAdmin) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: jsonHeaders,
+        });
+      }
+      try {
+        const body = await request.json();
+        const message = String(body.message || "").trim();
+        if (!message) {
+          return new Response(JSON.stringify({ error: "Message is required." }), {
+            status: 400,
+            headers: jsonHeaders,
+          });
+        }
+
+        let phones = [];
+        if (Array.isArray(body.phones) && body.phones.length) {
+          phones = body.phones;
+        } else if (Array.isArray(body.memberIds) && body.memberIds.length) {
+          const placeholders = body.memberIds.map(() => "?").join(",");
+          const rows = await env.DB.prepare(
+            `SELECT phone FROM members WHERE id IN (${placeholders}) AND phone IS NOT NULL AND phone != ''`
+          )
+            .bind(...body.memberIds)
+            .all();
+          phones = (rows.results || []).map((r) => r.phone);
+        } else if (body.allApproved === true) {
+          const rows = await env.DB.prepare(
+            `SELECT phone FROM members WHERE status = 'approved' AND phone IS NOT NULL AND phone != ''`
+          ).all();
+          phones = (rows.results || []).map((r) => r.phone);
+        } else {
+          return new Response(
+            JSON.stringify({ error: "Provide memberIds, phones, or allApproved: true." }),
+            { status: 400, headers: jsonHeaders }
+          );
+        }
+
+        const result = await sendSmsBulk(env, phones, message);
+        return new Response(JSON.stringify(result), {
+          status: result.ok ? 200 : 502,
+          headers: jsonHeaders,
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: "Server error", detail: String(err) }),
+          { status: 500, headers: jsonHeaders }
+        );
       }
     }
 
