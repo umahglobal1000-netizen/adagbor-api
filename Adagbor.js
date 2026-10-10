@@ -490,8 +490,15 @@ async function handleAdminCreateMember(request, env) {
     return json({ error: "Full name and phone are required." }, 400);
   }
 
-  const plainPassword = generateNumericPassword(6);
-  const { hash, salt } = await hashPassword(plainPassword);
+  // generate_pin: false adds the member without a PIN (generate one later).
+  const withPin = body.generate_pin !== false;
+  let plainPassword = null;
+  let hash = null;
+  let salt = null;
+  if (withPin) {
+    plainPassword = generateNumericPassword(6);
+    ({ hash, salt } = await hashPassword(plainPassword));
+  }
 
   let insertedId = null;
   try {
@@ -511,8 +518,8 @@ async function handleAdminCreateMember(request, env) {
       body.address || null,
       body.next_of_kin_name || null,
       body.next_of_kin_phone || null,
-      hash,
-      salt,
+      hash || "",
+      salt || "",
       body.photo || null
     ).run();
     insertedId = result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null;
@@ -534,13 +541,13 @@ async function handleAdminCreateMember(request, env) {
       body.address || null,
       body.next_of_kin_name || null,
       body.next_of_kin_phone || null,
-      hash,
-      salt
+      hash || "",
+      salt || ""
     ).run();
     insertedId = result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null;
   }
 
-  return json({ success: true, id: insertedId, password: plainPassword }, 201);
+  return json({ success: true, id: insertedId, password: plainPassword, pin: withPin }, 201);
 }
 
 // Admin pastes many names at once (one per line, optional ", phone" after the
@@ -548,7 +555,8 @@ async function handleAdminCreateMember(request, env) {
 // Codes are returned ONCE here and cannot be viewed again (only hashes are stored).
 // Kept to BULK_MAX per request because every code is hashed (CPU heavy) —
 // the admin page should send longer lists in chunks.
-const BULK_MAX = 25;
+const BULK_MAX = 25;          // with PINs: each PIN is hashed, which is CPU heavy
+const BULK_MAX_NO_PIN = 100;  // without PINs: nothing to hash
 
 async function handleBulkCreateMembers(request, env) {
   let body;
@@ -563,9 +571,13 @@ async function handleBulkCreateMembers(request, env) {
     : String(body.names || "").split(/\r?\n/);
   lines = lines.map((l) => String(l).trim()).filter(Boolean);
 
+  // generate_pin: false registers members without a PIN (generate one later).
+  const withPin = body.generate_pin !== false;
+  const limit = withPin ? BULK_MAX : BULK_MAX_NO_PIN;
+
   if (!lines.length) return json({ error: "No names provided." }, 400);
-  if (lines.length > BULK_MAX) {
-    return json({ error: `Send at most ${BULK_MAX} names per request.` }, 400);
+  if (lines.length > limit) {
+    return json({ error: `Send at most ${limit} names per request.` }, 400);
   }
 
   const results = [];
@@ -588,21 +600,26 @@ async function handleBulkCreateMembers(request, env) {
         continue;
       }
 
-      const code = generateNumericPassword(6);
-      const { hash, salt } = await hashPassword(code);
+      let code = "";
+      let hash = null;
+      let salt = null;
+      if (withPin) {
+        code = generateNumericPassword(6);
+        ({ hash, salt } = await hashPassword(code));
+      }
 
-      const insert = (phoneValue) =>
+      const insert = (phoneValue, h, sl) =>
         env.DB.prepare(
           `INSERT INTO members (full_name, phone, declared, status, password_hash, password_salt)
            VALUES (?, ?, 1, 'approved', ?, ?)`
-        ).bind(fullName, phoneValue, hash, salt).run();
+        ).bind(fullName, phoneValue, h, sl).run();
 
       let result;
       try {
-        result = await insert(phone);
+        result = await insert(phone, hash, salt);
       } catch (e) {
-        // phone column may be NOT NULL — retry with an empty string
-        result = await insert(phone || "");
+        // phone / password columns may be NOT NULL — retry with empty strings
+        result = await insert(phone || "", hash || "", salt || "");
       }
 
       const parts = normalizeName(fullName).split(" ");
@@ -612,6 +629,7 @@ async function handleBulkCreateMembers(request, env) {
         phone: phone || "",
         id: result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null,
         code,
+        pin: withPin,
         status: "created",
       });
     } catch (e) {
