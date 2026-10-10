@@ -783,6 +783,38 @@ export default {
     const url = new URL(request.url);
     const jsonHeaders = { "Content-Type": "application/json", ...corsHeaders };
 
+    // ---- Public: contribution totals only (no member names) ----
+    if (request.method === "GET" && url.pathname === "/api/public/contribution-totals") {
+      try {
+        const payments = await storeGet(env, "payments");
+        const list = Array.isArray(payments) ? payments : [];
+        const byType = new Map();
+        let total = 0;
+        let count = 0;
+        for (const p of list) {
+          const amount = Number(p && p.amount);
+          if (!(amount > 0)) continue;
+          const name = String(p.typeName || p.typeId || "Other").trim() || "Other";
+          const row = byType.get(name) || { name, total: 0, count: 0 };
+          row.total += amount;
+          row.count += 1;
+          byType.set(name, row);
+          total += amount;
+          count += 1;
+        }
+        const types = [...byType.values()].sort((a, b) => a.name.localeCompare(b.name));
+        return new Response(JSON.stringify({ total, count, types, updated: new Date().toISOString() }), {
+          status: 200,
+          headers: { ...jsonHeaders, "Cache-Control": "public, max-age=60" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Server error" }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+    }
+
     // ---- Public store read (announcements, resolutions, etc.) ----
     const storeMatch = url.pathname.match(/^\/api\/store\/([^/]+)$/);
     if (request.method === "GET" && storeMatch) {
