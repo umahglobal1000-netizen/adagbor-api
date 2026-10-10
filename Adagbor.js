@@ -985,14 +985,14 @@ export default {
           try {
             const q = await env.DB.prepare(
               `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email,
-                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at, photo
+                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at, photo, (password_hash IS NOT NULL AND password_hash != '') AS has_pin
                FROM members ORDER BY submitted_at DESC`
             ).all();
             results = q.results;
           } catch (e) {
             const q = await env.DB.prepare(
               `SELECT id, full_name, gender, date_of_birth, branch, occupation, phone, email,
-                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at
+                      address, next_of_kin_name, next_of_kin_phone, status, submitted_at, (password_hash IS NOT NULL AND password_hash != '') AS has_pin
                FROM members ORDER BY submitted_at DESC`
             ).all();
             results = q.results;
