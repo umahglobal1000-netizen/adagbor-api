@@ -130,6 +130,36 @@ async function storePut(env, key, value) {
   ).bind(key, JSON.stringify(value), now).run();
 }
 
+// ---------- Private store keys ----------
+// These hold member names and money records, so they are NOT publicly readable.
+//  - Admin reads them with the admin key (X-Admin-Key header).
+//  - A logged-in member reads only their own records via /api/member/data/:key.
+const PRIVATE_STORE_KEYS = new Set(["payments", "attendance", "expenses"]);
+
+async function getSessionMember(request, env) {
+  const token = getSessionToken(request);
+  if (!token) return null;
+  const session = await env.DB.prepare(
+    `SELECT member_id, expires_at FROM sessions WHERE token = ?`
+  ).bind(token).first();
+  if (!session || new Date(session.expires_at) < new Date()) return null;
+  return await env.DB.prepare(
+    `SELECT id, full_name, phone, email, status FROM members WHERE id = ?`
+  ).bind(session.member_id).first();
+}
+
+function memberRecordKey(m) {
+  return String(m.id != null ? m.id : (m.phone || m.email || m.full_name || "")).trim();
+}
+
+function recordBelongsToMember(record, member) {
+  if (!record || !member) return false;
+  if (record.memberKey != null && String(record.memberKey).trim() === memberRecordKey(member)) return true;
+  if (record.memberId != null && member.id != null && String(record.memberId) === String(member.id)) return true;
+  if (record.memberPhone && member.phone && String(record.memberPhone).trim() === String(member.phone).trim()) return true;
+  return false;
+}
+
 // ---------- KudiSMS (promotional gateway) ----------
 
 /** Normalise Nigerian phone → 234XXXXXXXXXX */
@@ -815,15 +845,68 @@ export default {
       }
     }
 
+    // ---- Member: own private data (payments, attendance) and expenses ----
+    const memberDataMatch = url.pathname.match(/^\/api\/member\/data\/([^/]+)$/);
+    if (request.method === "GET" && memberDataMatch) {
+      try {
+        const member = await getSessionMember(request, env);
+        if (!member) {
+          return new Response(JSON.stringify({ error: "Not logged in." }), {
+            status: 401,
+            headers: jsonHeaders,
+          });
+        }
+        const key = decodeURIComponent(memberDataMatch[1]);
+        const raw = await storeGet(env, key);
+        let value;
+        if (key === "payments") {
+          value = (Array.isArray(raw) ? raw : []).filter((r) => recordBelongsToMember(r, member));
+        } else if (key === "attendance") {
+          const data = raw && typeof raw === "object" ? raw : {};
+          value = {
+            sessions: Array.isArray(data.sessions) ? data.sessions : [],
+            records: (Array.isArray(data.records) ? data.records : []).filter((r) => recordBelongsToMember(r, member)),
+          };
+        } else if (key === "expenses") {
+          value = Array.isArray(raw) ? raw : [];
+        } else {
+          return new Response(JSON.stringify({ error: "Not found." }), {
+            status: 404,
+            headers: jsonHeaders,
+          });
+        }
+        return new Response(JSON.stringify({ value }), {
+          status: 200,
+          headers: { ...jsonHeaders, "Cache-Control": "no-store" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Server error" }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
+    }
+
     // ---- Public store read (announcements, resolutions, etc.) ----
     const storeMatch = url.pathname.match(/^\/api\/store\/([^/]+)$/);
     if (request.method === "GET" && storeMatch) {
       try {
         const key = decodeURIComponent(storeMatch[1]);
+        if (PRIVATE_STORE_KEYS.has(key)) {
+          const hdr = request.headers.get("X-Admin-Key");
+          if (!(hdr && env.ADMIN_KEY && hdr === env.ADMIN_KEY)) {
+            return new Response(JSON.stringify({ error: "Not allowed." }), {
+              status: 401,
+              headers: jsonHeaders,
+            });
+          }
+        }
         const value = await storeGet(env, key);
         return new Response(JSON.stringify({ value }), {
           status: 200,
-          headers: jsonHeaders,
+          headers: PRIVATE_STORE_KEYS.has(key)
+            ? { ...jsonHeaders, "Cache-Control": "no-store" }
+            : jsonHeaders,
         });
       } catch (err) {
         return new Response(JSON.stringify({ error: "Server error", detail: String(err) }), {
