@@ -237,24 +237,154 @@ async function sendSmsBulk(env, phones, message) {
 
 // ---------- Login ----------
 
+// ---------- Login attempt limiting ----------
+// 6-digit codes have only 1,000,000 combinations, so guessing must be throttled.
+// Table is created automatically on first login attempt (no manual D1 step).
+
+const LOGIN_WINDOW_MINUTES = 30;   // failures are counted within this window
+const LOGIN_MAX_FAILS_NAME = 6;    // per surname (or email/phone) before lock
+const LOGIN_MAX_FAILS_IP = 12;     // per IP address before lock
+const LOGIN_MAX_CANDIDATES = 30;   // max members with the same surname checked per login
+let attemptsTableReady = false;
+
+async function ensureAttemptsTable(env) {
+  if (attemptsTableReady) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS login_attempts (
+       key TEXT PRIMARY KEY,
+       fails INTEGER NOT NULL DEFAULT 0,
+       window_start INTEGER NOT NULL,
+       locked_until INTEGER NOT NULL DEFAULT 0
+     )`
+  ).run();
+  attemptsTableReady = true;
+}
+
+async function lockedMinutes(env, keys) {
+  const now = Date.now();
+  let wait = 0;
+  for (const key of keys) {
+    const row = await env.DB.prepare(
+      `SELECT locked_until FROM login_attempts WHERE key = ?`
+    ).bind(key).first();
+    if (row && row.locked_until > now) {
+      wait = Math.max(wait, Math.ceil((row.locked_until - now) / 60000));
+    }
+  }
+  return wait;
+}
+
+async function recordFailure(env, key, maxFails) {
+  const now = Date.now();
+  const windowMs = LOGIN_WINDOW_MINUTES * 60 * 1000;
+  const row = await env.DB.prepare(
+    `SELECT fails, window_start FROM login_attempts WHERE key = ?`
+  ).bind(key).first();
+
+  let fails = 1;
+  let windowStart = now;
+  if (row && now - row.window_start <= windowMs) {
+    fails = row.fails + 1;
+    windowStart = row.window_start;
+  }
+  const lockedUntil = fails >= maxFails ? now + windowMs : 0;
+
+  await env.DB.prepare(
+    `INSERT INTO login_attempts (key, fails, window_start, locked_until)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(key) DO UPDATE SET
+       fails = excluded.fails,
+       window_start = excluded.window_start,
+       locked_until = excluded.locked_until`
+  ).bind(key, fails, windowStart, lockedUntil).run();
+}
+
+// ---------- Login ----------
+// Members log in with SURNAME + 6-digit code. Any word of the full name counts
+// as a match (so "Haruna" works for both "Umar Haruna" and "Haruna Umar").
+// Several members can share a surname, so the code is checked against each of
+// them and the one whose code matches is the member.
+// Email/phone + password still works as before (for older accounts / admins).
+
+function normalizeName(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[,.]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function handleLogin(request, env) {
-  const { identifier, password } = await request.json();
-  if (!identifier || !password) {
-    return json({ error: "Missing credentials." }, 400);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid request." }, 400);
   }
 
-  const member = await env.DB.prepare(
-    `SELECT id, password_hash, password_salt, status FROM members
-     WHERE email = ?1 OR phone = ?1`
-  ).bind(identifier).first();
-
-  if (!member || !member.password_hash) {
-    return json({ error: "Invalid email/phone or password." }, 401);
+  const rawId = String(body.surname || body.identifier || "").trim();
+  const password = String(body.code || body.password || "").trim();
+  if (!rawId || !password) {
+    return json({ error: "Please enter your surname and code." }, 400);
+  }
+  if (rawId.length > 60 || password.length > 100) {
+    return json({ error: "Invalid request." }, 400);
   }
 
-  const ok = await verifyPassword(password, member.password_hash, member.password_salt);
-  if (!ok) {
-    return json({ error: "Invalid email/phone or password." }, 401);
+  await ensureAttemptsTable(env);
+
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const ipKey = "ip:" + ip;
+  const isContact = rawId.includes("@") || /^\+?[\d\s-]{9,}$/.test(rawId);
+  const needle = normalizeName(rawId);
+  const nameKey = (isContact ? "id:" : "s:") + (isContact ? rawId.toLowerCase() : needle);
+
+  const wait = await lockedMinutes(env, [ipKey, nameKey]);
+  if (wait > 0) {
+    return json(
+      { error: `Too many failed attempts. Please try again in ${wait} minute(s).` },
+      429
+    );
+  }
+
+  // ---- Find candidate members ----
+  let candidates = [];
+  if (isContact) {
+    const m = await env.DB.prepare(
+      `SELECT id, password_hash, password_salt, status FROM members
+       WHERE email = ?1 OR phone = ?1`
+    ).bind(rawId).first();
+    if (m) candidates = [m];
+  } else if (needle) {
+    const like = "%" + needle.replace(/[\\%_]/g, "\\$&") + "%";
+    const q = await env.DB.prepare(
+      `SELECT id, full_name, password_hash, password_salt, status FROM members
+       WHERE lower(full_name) LIKE ?1 ESCAPE '\\' AND password_hash IS NOT NULL
+       LIMIT 200`
+    ).bind(like).all();
+    const padded = " " + needle + " ";
+    candidates = (q.results || [])
+      .filter((r) => (" " + normalizeName(r.full_name) + " ").includes(padded))
+      .slice(0, LOGIN_MAX_CANDIDATES);
+  }
+
+  // ---- Check the code against each candidate ----
+  let member = null;
+  for (const c of candidates) {
+    if (!c.password_hash) continue;
+    if (await verifyPassword(password, c.password_hash, c.password_salt)) {
+      member = c;
+      break;
+    }
+  }
+
+  if (!member) {
+    await recordFailure(env, ipKey, LOGIN_MAX_FAILS_IP);
+    if (candidates.length) await recordFailure(env, nameKey, LOGIN_MAX_FAILS_NAME);
+    return json(
+      { error: isContact ? "Invalid email/phone or password." : "Invalid surname or code." },
+      401
+    );
   }
 
   if (member.status === "pending") {
@@ -411,6 +541,89 @@ async function handleAdminCreateMember(request, env) {
   }
 
   return json({ success: true, id: insertedId, password: plainPassword }, 201);
+}
+
+// Admin pastes many names at once (one per line, optional ", phone" after the
+// name). Each new member is created as approved with a generated 6-digit code.
+// Codes are returned ONCE here and cannot be viewed again (only hashes are stored).
+// Kept to BULK_MAX per request because every code is hashed (CPU heavy) —
+// the admin page should send longer lists in chunks.
+const BULK_MAX = 25;
+
+async function handleBulkCreateMembers(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid request." }, 400);
+  }
+
+  let lines = Array.isArray(body.names)
+    ? body.names
+    : String(body.names || "").split(/\r?\n/);
+  lines = lines.map((l) => String(l).trim()).filter(Boolean);
+
+  if (!lines.length) return json({ error: "No names provided." }, 400);
+  if (lines.length > BULK_MAX) {
+    return json({ error: `Send at most ${BULK_MAX} names per request.` }, 400);
+  }
+
+  const results = [];
+  for (const line of lines) {
+    const m = line.match(/^(.*?)[,\t]\s*(\+?[\d\s-]{9,})\s*$/);
+    const fullName = (m ? m[1] : line).replace(/\s+/g, " ").trim();
+    const phone = m ? m[2].trim() : null;
+
+    if (fullName.length < 2) {
+      results.push({ name: line, status: "error", reason: "Name too short" });
+      continue;
+    }
+
+    try {
+      const existing = await env.DB.prepare(
+        `SELECT id FROM members WHERE lower(full_name) = lower(?)`
+      ).bind(fullName).first();
+      if (existing) {
+        results.push({ name: fullName, status: "skipped", reason: "Name already exists" });
+        continue;
+      }
+
+      const code = generateNumericPassword(6);
+      const { hash, salt } = await hashPassword(code);
+
+      const insert = (phoneValue) =>
+        env.DB.prepare(
+          `INSERT INTO members (full_name, phone, declared, status, password_hash, password_salt)
+           VALUES (?, ?, 1, 'approved', ?, ?)`
+        ).bind(fullName, phoneValue, hash, salt).run();
+
+      let result;
+      try {
+        result = await insert(phone);
+      } catch (e) {
+        // phone column may be NOT NULL — retry with an empty string
+        result = await insert(phone || "");
+      }
+
+      const parts = normalizeName(fullName).split(" ");
+      results.push({
+        name: fullName,
+        surname: parts[parts.length - 1],
+        phone: phone || "",
+        id: result.meta && result.meta.last_row_id != null ? result.meta.last_row_id : null,
+        code,
+        status: "created",
+      });
+    } catch (e) {
+      results.push({ name: fullName, status: "error", reason: String(e).slice(0, 120) });
+    }
+  }
+
+  return json({
+    success: true,
+    created: results.filter((r) => r.status === "created").length,
+    results,
+  }, 201);
 }
 
 // Admin generates a fresh numeric password for a member who lost theirs.
@@ -961,6 +1174,24 @@ export default {
       const memberId = Number(setPasswordMatch[1]);
       const res = await handleSetPassword(request, env, memberId);
       return withCors(res, corsHeaders);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/admin/members/bulk") {
+      if (!isAdmin) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: jsonHeaders,
+        });
+      }
+      try {
+        const res = await handleBulkCreateMembers(request, env);
+        return withCors(res, corsHeaders);
+      } catch (err) {
+        return new Response(JSON.stringify({ error: "Server error", detail: String(err) }), {
+          status: 500,
+          headers: jsonHeaders,
+        });
+      }
     }
 
     const generatePasswordMatch = url.pathname.match(/^\/api\/admin\/members\/(\d+)\/generate-password$/);
