@@ -134,7 +134,7 @@ async function storePut(env, key, value) {
 // These hold member names and money records, so they are NOT publicly readable.
 //  - Admin reads them with the admin key (X-Admin-Key header).
 //  - A logged-in member reads only their own records via /api/member/data/:key.
-const PRIVATE_STORE_KEYS = new Set(["payments", "attendance", "expenses"]);
+const PRIVATE_STORE_KEYS = new Set(["payments", "attendance", "expenses", "guest_contributors"]);
 
 async function getSessionMember(request, env) {
   const token = getSessionToken(request);
